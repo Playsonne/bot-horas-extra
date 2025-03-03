@@ -1,0 +1,101 @@
+import logging
+import firebase_admin
+from firebase_admin import credentials, firestore
+from telegram import Update
+from telegram.ext import Application, CommandHandler, CallbackContext
+from datetime import datetime
+import pandas as pd
+import os
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
+# Configurar Firebase
+cred = credentials.Certificate("firebase_credentials.json")
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
+# Configurar Google Sheets
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+gs_credentials = ServiceAccountCredentials.from_json_keyfile_name("google_sheets_credentials.json", scope)
+gc = gspread.authorize(gs_credentials)
+sheet = gc.open_by_key("1-KpZmMWVPoCRNW4UfgfYgBQQvpbKSRE3W7fUARN5z7g")  # ID de tu Google Sheets
+
+# Configurar logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# Comando de inicio
+async def start(update: Update, context: CallbackContext) -> None:
+    await update.message.reply_text("Hola! Usa /entrada para registrar tu hora de inicio y /salida para registrar la salida.")
+
+# Registrar entrada
+async def entrada(update: Update, context: CallbackContext) -> None:
+    user_id = update.message.from_user.id
+    fecha = datetime.now().strftime("%Y-%m-%d")
+    hora_entrada = datetime.now().strftime("%H:%M:%S")
+    
+    db.collection("horas_extra").document(f"{user_id}_{fecha}").set({
+        "usuario": user_id,
+        "fecha": fecha,
+        "hora_entrada": hora_entrada
+    }, merge=True)
+    
+    await update.message.reply_text(f"Entrada registrada a las {hora_entrada}.")
+
+# Registrar salida y actualizar resumen en Google Sheets
+async def salida(update: Update, context: CallbackContext) -> None:
+    user_id = update.message.from_user.id
+    fecha = datetime.now().strftime("%Y-%m-%d")
+    hora_salida = datetime.now().strftime("%H:%M:%S")
+    
+    doc_ref = db.collection("horas_extra").document(f"{user_id}_{fecha}")
+    doc = doc_ref.get()
+    if doc.exists:
+        data = doc.to_dict()
+        hora_entrada = data.get("hora_entrada", None)
+        
+        if hora_entrada:
+            fmt = "%H:%M:%S"
+            entrada_dt = datetime.strptime(hora_entrada, fmt)
+            salida_dt = datetime.strptime(hora_salida, fmt)
+            
+            total_trabajado = (salida_dt - entrada_dt).total_seconds() / 3600
+            JORNADA_LABORAL = 8
+            
+            horas_extra = max(0, total_trabajado - JORNADA_LABORAL)
+            
+            doc_ref.update({
+                "hora_salida": hora_salida,
+                "horas_trabajadas": total_trabajado,
+                "horas_extra": horas_extra
+            })
+            
+            sheet_data = sheet.worksheet("Horas Extra")
+            sheet_data.append_row([fecha, hora_entrada, hora_salida, total_trabajado, horas_extra])
+            
+            resumen = sheet.worksheet("Resumen")
+            resumen.update_acell("B2", "=SUMAR.SI('Horas Extra'!A:A; \"\u003e=\"&HOY()-DIASEM(HOY();2)+1; 'Horas Extra'!D:D)")
+            resumen.update_acell("C2", "=SUMAR.SI('Horas Extra'!A:A; \"\u003e=\"&HOY()-DIASEM(HOY();2)+1; 'Horas Extra'!E:E)")
+            resumen.update_acell("B4", "=SUMAR.SI('Horas Extra'!A:A; \"\u003e=\"&EOMES(HOY();-1)+1; 'Horas Extra'!D:D)")
+            resumen.update_acell("C4", "=SUMAR.SI('Horas Extra'!A:A; \"\u003e=\"&EOMES(HOY();-1)+1; 'Horas Extra'!E:E)")
+            
+            await update.message.reply_text(f"Salida registrada a las {hora_salida}.\nTotal trabajado: {total_trabajado:.2f} horas.\nHoras extra: {horas_extra:.2f}. Resumen actualizado.")
+        else:
+            await update.message.reply_text("No se encontró una hora de entrada para hoy. Usa /entrada primero.")
+    else:
+        await update.message.reply_text("No se encontró una entrada para hoy. Usa /entrada primero.")
+
+# Configurar el bot
+def main():
+    TOKEN = "7574046635:AAHY7LJT5jqliRcXOC-BIzv0K_7bsTPj6x0"
+
+    app = Application.builder().token(TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("entrada", entrada))
+    app.add_handler(CommandHandler("salida", salida))
+    
+    print("✅ Bot iniciado correctamente...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
